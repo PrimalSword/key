@@ -1,7 +1,3 @@
-import java.util.Base64
-import java.util.zip.GZIPInputStream
-import java.io.ByteArrayInputStream
-
 plugins {
     id 'com.android.application'
 }
@@ -22,48 +18,8 @@ android {
         }
     }
 
-    packaging {
-        jniLibs {
-            useLegacyPackaging = true
-        }
-    }
-
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
-}
-
-def nativeSourceDir = file("$rootDir/native-gzb64")
-def nativeOutputDir = file("$projectDir/src/main/jniLibs/arm64-v8a")
-
-tasks.register('restoreNativeLibs') {
-    inputs.files(fileTree(nativeSourceDir) { include '*.b64.*' })
-    outputs.files(
-            file("$nativeOutputDir/libVCTP2P.so"),
-            file("$nativeOutputDir/libc++_shared.so")
-    )
-
-    doLast {
-        nativeOutputDir.mkdirs()
-
-        def restore = { String outputName ->
-            String prefix = "${outputName}.gz.b64"
-            def parts = fileTree(nativeSourceDir) { include "${prefix}.*" }.files.sort { a, b -> a.name <=> b.name }
-            if (parts.isEmpty()) throw new GradleException("Native compactado ausente: ${prefix}")
-            StringBuilder encoded = new StringBuilder()
-            parts.each { part -> encoded.append(part.getText('UTF-8').replaceAll('\\s', '')) }
-            byte[] gz = Base64.getDecoder().decode(encoded.toString())
-            GZIPInputStream gzip = new GZIPInputStream(new ByteArrayInputStream(gz))
-            file("$nativeOutputDir/$outputName").withOutputStream { out -> gzip.transferTo(out) }
-            gzip.close()
-        }
-
-        restore('libVCTP2P.so')
-        restore('libc++_shared.so')
-    }
-}
-
-tasks.named('preBuild').configure {
-    dependsOn tasks.named('restoreNativeLibs')
 }
