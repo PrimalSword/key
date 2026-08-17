@@ -11,6 +11,7 @@ import com.kement.doorbell.p2p.P2PSession;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.util.Iterator;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -30,6 +31,8 @@ final class KementEngine implements CommandChannel.Listener, P2PSession.P2PClien
 
     private static final int MAX_P2P_ATTEMPTS = 8;
     private static final long MIN_STREAM_START_INTERVAL_MS = 2200L;
+    private static final long WAIT_PROBE_INTERVAL_MS = 2500L;
+    private static final long WAIT_PROBE_WINDOW_MS = 90_000L;
 
     private final Context context;
     private final Listener listener;
@@ -54,6 +57,11 @@ final class KementEngine implements CommandChannel.Listener, P2PSession.P2PClien
     private volatile boolean streamStartOk;
     private volatile boolean deviceSeenInState;
     private volatile ScheduledFuture<?> statePollTask;
+    private volatile long waitProbeStartedAt;
+    private volatile int waitProbeCount;
+    private volatile int lastWaitProbeErr = Integer.MIN_VALUE;
+    private volatile boolean waitProbeExpiredLogged;
+    private volatile boolean devicesStateShapeLogged;
     private PowerManager.WakeLock wakeLock;
 
     KementEngine(Context context, Listener listener) {
@@ -119,12 +127,38 @@ final class KementEngine implements CommandChannel.Listener, P2PSession.P2PClien
     private synchronized void startStatePolling() {
         if (previewActive) return;
         if (statePollTask != null) statePollTask.cancel(false);
+        waitProbeStartedAt = System.currentTimeMillis();
+        waitProbeCount = 0;
+        lastWaitProbeErr = Integer.MIN_VALUE;
+        waitProbeExpiredLogged = false;
+        devicesStateShapeLogged = false;
         statePollTask = scheduler.scheduleAtFixedRate(() -> {
             if (!wanted.get() || previewActive) return;
             CommandChannel c = command;
-            if (c != null) c.sendDevicesState();
-        }, 1, 1, TimeUnit.SECONDS);
-        listener.onLog("Fallback ativo: consultando devices-state a cada 1 s.");
+            if (c == null) return;
+            c.sendDevicesState();
+
+            long elapsed = System.currentTimeMillis() - waitProbeStartedAt;
+            if (elapsed <= WAIT_PROBE_WINDOW_MS) {
+                sendWaitingStreamProbe();
+            } else if (!waitProbeExpiredLogged) {
+                waitProbeExpiredLogged = true;
+                listener.onLog("Janela de detecção direta expirou após 90 s; reconecte para armar novamente.");
+            }
+        }, 1, WAIT_PROBE_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        listener.onLog("Fallback 0.5 armado: devices-state + stream-start probe por 90 s.");
+    }
+
+    private synchronized void sendWaitingStreamProbe() {
+        if (!wanted.get() || previewActive || command == null || sn == null) return;
+        long now = System.currentTimeMillis();
+        if (now - lastStreamStartAt < MIN_STREAM_START_INTERVAL_MS) return;
+        lastStreamStartAt = now;
+        waitProbeCount++;
+        command.sendStreamStart(sn);
+        if (waitProbeCount == 1 || waitProbeCount % 10 == 0) {
+            listener.onLog("Sonda de mídia aguardando toque | tentativa=" + waitProbeCount);
+        }
     }
 
     private synchronized void stopStatePolling() {
@@ -166,6 +200,11 @@ final class KementEngine implements CommandChannel.Listener, P2PSession.P2PClien
         p2pConnectAttempts = 0;
         lastStreamStartAt = 0L;
         deviceSeenInState = false;
+        waitProbeStartedAt = 0L;
+        waitProbeCount = 0;
+        lastWaitProbeErr = Integer.MIN_VALUE;
+        waitProbeExpiredLogged = false;
+        devicesStateShapeLogged = false;
         pipeline.reset();
         releaseWakeLock();
         if (notifyUi) listener.onStatus("Sessão encerrada.");
@@ -198,6 +237,19 @@ final class KementEngine implements CommandChannel.Listener, P2PSession.P2PClien
             return;
         }
 
+        if ("device-state".equals(cmd) && sn != null && sn.equals(udid)) {
+            int state = msg.optInt("state", -1);
+            int mode = msg.optInt("mode", -1);
+            listener.onLog("device-state | state=" + state + " | mode=" + mode);
+            if (!previewActive && (state == 1 || mode == 2)) {
+                activatePreview("device-state");
+                listener.onStatus("Campainha acordou por device-state. Preparando mídia...");
+                requestStreamStart("device-state");
+                scheduleP2PConnect("device-state", 800);
+            }
+            return;
+        }
+
         if ("preview-start".equals(cmd) && sn != null && sn.equals(udid)) {
             activatePreview("preview-start");
             String wakeup = msg.optString("wakeup_type", "?");
@@ -222,12 +274,21 @@ final class KementEngine implements CommandChannel.Listener, P2PSession.P2PClien
             int err = msg.optInt("err_no", -999);
             String peer = msg.optString("peer", "");
             String pk = msg.optString("pk", "");
-            listener.onLog("stream-start resposta | err=" + err + " | peer=" + peer
-                    + " | ip=" + msg.optString("ip", "") + " | video_port=" + msg.optInt("video_port", 0)
-                    + " | pk=" + (pk.isEmpty() ? "vazio" : "presente"));
+
+            if (previewActive || err == 0 || err != lastWaitProbeErr || waitProbeCount % 10 == 0) {
+                listener.onLog("stream-start resposta | err=" + err + " | peer=" + peer
+                        + " | ip=" + msg.optString("ip", "") + " | video_port=" + msg.optInt("video_port", 0)
+                        + " | pk=" + (pk.isEmpty() ? "vazio" : "presente"));
+            }
+            lastWaitProbeErr = err;
+
             if (!pk.isEmpty()) pipeline.setMediaKey(pk);
             if (err == 0) {
-                if (!previewActive) activatePreview("stream-start OK");
+                if (!previewActive) {
+                    listener.onLog("Sonda direta detectou a câmera pronta sem depender do preview-start.");
+                    activatePreview("stream-start probe OK");
+                    listener.onStatus("Campainha pronta. Abrindo P2P...");
+                }
                 streamStartOk = true;
                 scheduleP2PConnect("stream-start OK", 300);
             }
@@ -258,36 +319,62 @@ final class KementEngine implements CommandChannel.Listener, P2PSession.P2PClien
     }
 
     private void handleDevicesState(JSONObject msg) {
-        JSONArray devices = msg.optJSONArray("devices");
-        if (devices == null) return;
-        JSONObject mine = null;
-        for (int i = 0; i < devices.length(); i++) {
-            JSONObject d = devices.optJSONObject(i);
-            if (d == null) continue;
-            String peer = d.optString("sn", d.optString("peer", d.optString("udid", "")));
-            if (sn != null && sn.equals(peer)) {
-                mine = d;
-                break;
-            }
+        if (!devicesStateShapeLogged) {
+            devicesStateShapeLogged = true;
+            String raw = msg.toString();
+            if (raw.length() > 700) raw = raw.substring(0, 700) + "...";
+            listener.onLog("devices-state RAW: " + raw);
         }
 
-        boolean seen = mine != null;
-        if (seen != deviceSeenInState) {
-            deviceSeenInState = seen;
-            if (seen) {
-                listener.onLog("devices-state: campainha apareceu ONLINE | status="
-                        + mine.opt("status") + " | mode=" + mine.opt("mode"));
+        JSONObject mine = findDeviceRecursive(msg, 0);
+        boolean awake = mine != null && looksAwake(mine);
+        if (awake != deviceSeenInState) {
+            deviceSeenInState = awake;
+            if (awake) {
+                listener.onLog("devices-state: campainha acordada | state=" + mine.opt("state")
+                        + " | status=" + mine.opt("status") + " | mode=" + mine.opt("mode"));
             } else {
-                listener.onLog("devices-state: campainha offline/ausente.");
+                listener.onLog("devices-state: sem indicação de câmera acordada.");
             }
         }
 
-        if (seen && !previewActive) {
+        if (awake && !previewActive) {
             activatePreview("devices-state");
             listener.onStatus("Campainha online detectada. Abrindo vídeo...");
             requestStreamStart("devices-state fallback");
             scheduleP2PConnect("devices-state fallback", 800);
         }
+    }
+
+    private JSONObject findDeviceRecursive(Object node, int depth) {
+        if (node == null || node == JSONObject.NULL || depth > 6) return null;
+        if (node instanceof JSONObject) {
+            JSONObject o = (JSONObject) node;
+            String id = o.optString("sn", o.optString("peer", o.optString("udid", "")));
+            if (sn != null && sn.equals(id)) return o;
+            Iterator<String> keys = o.keys();
+            while (keys.hasNext()) {
+                String key = keys.next();
+                JSONObject found = findDeviceRecursive(o.opt(key), depth + 1);
+                if (found != null) return found;
+            }
+        } else if (node instanceof JSONArray) {
+            JSONArray a = (JSONArray) node;
+            for (int i = 0; i < a.length(); i++) {
+                JSONObject found = findDeviceRecursive(a.opt(i), depth + 1);
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
+    private boolean looksAwake(JSONObject o) {
+        if (o == null) return false;
+        if (o.has("online") && o.optBoolean("online", false)) return true;
+        int state = o.optInt("state", -999);
+        int status = o.optInt("status", -999);
+        int mode = o.optInt("mode", -999);
+        return state == 1 || status == 1 || mode == 2;
     }
 
     private synchronized void activatePreview(String source) {
