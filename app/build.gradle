@@ -1,0 +1,71 @@
+import java.util.Base64
+
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.kement.printcam'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.kement.printcam'
+        minSdk 26
+        targetSdk 35
+        versionCode 3
+        versionName '0.3.0-lab'
+
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+// GitHub's text-file API is used to keep this project entirely maintainable from ChatGPT.
+// The two proprietary/prebuilt native libraries are stored as base64 text chunks and
+// reconstructed automatically before every Android build.
+def nativeSourceDir = file("$rootDir/native-b64")
+def nativeOutputDir = file("$projectDir/src/main/jniLibs/arm64-v8a")
+
+tasks.register('restoreNativeLibs') {
+    inputs.files(fileTree(nativeSourceDir) { include '*.b64*' })
+    outputs.files(
+            file("$nativeOutputDir/libVCTP2P.so"),
+            file("$nativeOutputDir/libc++_shared.so")
+    )
+
+    doLast {
+        nativeOutputDir.mkdirs()
+
+        def restore = { String outputName, List<String> parts ->
+            StringBuilder encoded = new StringBuilder()
+            parts.each { part ->
+                encoded.append(file("$nativeSourceDir/$part").getText('UTF-8').replaceAll('\\s', ''))
+            }
+            file("$nativeOutputDir/$outputName").bytes = Base64.getDecoder().decode(encoded.toString())
+        }
+
+        restore('libVCTP2P.so', ['libVCTP2P.so.b64'])
+        restore('libc++_shared.so', [
+                'libc++_shared.so.b64.001',
+                'libc++_shared.so.b64.002',
+                'libc++_shared.so.b64.003',
+                'libc++_shared.so.b64.004'
+        ])
+    }
+}
+
+tasks.named('preBuild').configure {
+    dependsOn tasks.named('restoreNativeLibs')
+}
