@@ -32,9 +32,6 @@ android {
     }
 }
 
-// GitHub's text-file API is used to keep this project entirely maintainable from ChatGPT.
-// The two proprietary/prebuilt native libraries are stored as base64 text chunks and
-// reconstructed automatically before every Android build.
 def nativeSourceDir = file("$rootDir/native-b64")
 def nativeOutputDir = file("$projectDir/src/main/jniLibs/arm64-v8a")
 
@@ -48,21 +45,18 @@ tasks.register('restoreNativeLibs') {
     doLast {
         nativeOutputDir.mkdirs()
 
-        def restore = { String outputName, List<String> parts ->
+        def restore = { String outputName, String prefix ->
             StringBuilder encoded = new StringBuilder()
+            def parts = fileTree(nativeSourceDir) { include "${prefix}.*" }.files.sort { a, b -> a.name <=> b.name }
+            if (parts.isEmpty()) throw new GradleException("Native base64 ausente: ${prefix}")
             parts.each { part ->
-                encoded.append(file("$nativeSourceDir/$part").getText('UTF-8').replaceAll('\\s', ''))
+                encoded.append(part.getText('UTF-8').replaceAll('\\s', ''))
             }
             file("$nativeOutputDir/$outputName").bytes = Base64.getDecoder().decode(encoded.toString())
         }
 
-        restore('libVCTP2P.so', ['libVCTP2P.so.b64'])
-        restore('libc++_shared.so', [
-                'libc++_shared.so.b64.001',
-                'libc++_shared.so.b64.002',
-                'libc++_shared.so.b64.003',
-                'libc++_shared.so.b64.004'
-        ])
+        restore('libVCTP2P.so', 'libVCTP2P.so.b64')
+        restore('libc++_shared.so', 'libc++_shared.so.b64')
     }
 }
 
