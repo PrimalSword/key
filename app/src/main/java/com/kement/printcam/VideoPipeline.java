@@ -29,11 +29,14 @@ final class VideoPipeline {
     }
 
     void setMediaKey(String key) {
-        mediaKey = key == null ? "" : key;
-        if (!mediaKey.isEmpty()) {
-            listener.onPipelineStatus("A câmera anunciou mídia AES (pk não vazio); este build ainda não decripta esse caminho.");
+        String next = key == null ? "" : key;
+        boolean changed = !next.equals(mediaKey);
+        mediaKey = next;
+        if (changed && !mediaKey.isEmpty()) {
+            listener.onPipelineStatus("Mídia AES ativa; decryptAESData oficial habilitado.");
         }
     }
+
     void setSurface(Surface surface) { decoder.setSurface(surface); }
     void clearSurface() { decoder.clearSurface(); }
 
@@ -41,9 +44,14 @@ final class VideoPipeline {
         long pcount = packets.incrementAndGet();
         MediaPacket p = MediaPacket.parse(raw, mediaKey);
         if (p == null) {
-            if ((pcount % 250) == 1) listener.onPacketStats(pcount, videoPackets.get(), lastType);
+            if ((pcount % 50) == 1) {
+                String error = MediaPacket.consumeLastParseError();
+                if (!error.isEmpty()) listener.onPipelineStatus(error);
+                listener.onPacketStats(pcount, videoPackets.get(), lastType);
+            }
             return;
         }
+
         lastType = p.type;
         if (p.type == MediaPacket.TYPE_AVC || p.type == MediaPacket.TYPE_HEVC) {
             long v = videoPackets.incrementAndGet();
@@ -56,8 +64,13 @@ final class VideoPipeline {
     }
 
     void reset() {
-        packets.set(0); videoPackets.set(0); lastType = -1; mediaKey = "";
+        packets.set(0);
+        videoPackets.set(0);
+        lastType = -1;
+        mediaKey = "";
+        MediaPacket.consumeLastParseError();
         decoder.reset();
     }
+
     void shutdown() { decoder.shutdown(); }
 }

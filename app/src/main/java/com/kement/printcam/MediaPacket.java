@@ -1,5 +1,7 @@
 package com.kement.printcam;
 
+import cn.coderfly.ezmediautils.EZMediaUtils;
+
 import java.util.Arrays;
 
 final class MediaPacket {
@@ -11,6 +13,8 @@ final class MediaPacket {
     static final int TYPE_AUDIO_PCM = 103;
     static final int TYPE_AUDIO_ILBC = 105;
 
+    private static volatile String lastParseError = "";
+
     final int type;
     final int flags;
     final int sequence;
@@ -19,8 +23,12 @@ final class MediaPacket {
     final byte[] payload;
 
     private MediaPacket(int type, int flags, int sequence, long timestamp, int aux, byte[] payload) {
-        this.type = type; this.flags = flags; this.sequence = sequence;
-        this.timestamp = timestamp; this.aux = aux; this.payload = payload;
+        this.type = type;
+        this.flags = flags;
+        this.sequence = sequence;
+        this.timestamp = timestamp;
+        this.aux = aux;
+        this.payload = payload;
     }
 
     static MediaPacket parse(byte[] raw, String mediaKey) {
@@ -31,8 +39,6 @@ final class MediaPacket {
         if (!(type == 95 || type == 96 || type == 97 || type == 100 ||
                 type == 101 || type == 102 || type == 103 || type == 105)) return null;
 
-        if (mediaKey != null && !mediaKey.isEmpty()) return null;
-
         int sequence = (raw[2] & 0xff) | ((raw[3] & 0xff) << 8);
         long timestamp = ((long) raw[4] & 0xff)
                 | (((long) raw[5] & 0xff) << 8)
@@ -41,7 +47,29 @@ final class MediaPacket {
         int aux = (raw[8] & 0xff) | ((raw[9] & 0xff) << 8)
                 | ((raw[10] & 0xff) << 16) | ((raw[11] & 0xff) << 24);
         int flags = raw[0] & 0x03;
-        return new MediaPacket(type, flags, sequence, timestamp, aux,
-                Arrays.copyOfRange(raw, 12, raw.length));
+        byte[] payload = Arrays.copyOfRange(raw, 12, raw.length);
+
+        if (mediaKey != null && !mediaKey.isEmpty()) {
+            try {
+                payload = EZMediaUtils.decryptAESData(payload, mediaKey, aux);
+                if (payload == null || payload.length == 0) {
+                    lastParseError = "decryptAESData retornou payload vazio";
+                    return null;
+                }
+            } catch (Throwable e) {
+                String m = e.getMessage();
+                lastParseError = "AES falhou: " + (m == null || m.isEmpty() ? e.getClass().getSimpleName() : m);
+                return null;
+            }
+        }
+
+        lastParseError = "";
+        return new MediaPacket(type, flags, sequence, timestamp, aux, payload);
+    }
+
+    static String consumeLastParseError() {
+        String value = lastParseError;
+        lastParseError = "";
+        return value;
     }
 }

@@ -4,6 +4,8 @@ import android.content.Context;
 import android.os.PowerManager;
 import android.view.Surface;
 
+import cn.coderfly.ezmediautils.EZMediaUtils;
+
 import com.kement.doorbell.p2p.P2PSession;
 
 import org.json.JSONArray;
@@ -26,6 +28,9 @@ final class KementEngine implements CommandChannel.Listener, P2PSession.P2PClien
         void onBattery(Integer battery, Integer rssi);
     }
 
+    private static final int MAX_P2P_ATTEMPTS = 8;
+    private static final long MIN_STREAM_START_INTERVAL_MS = 2200L;
+
     private final Context context;
     private final Listener listener;
     private final ExecutorService worker = Executors.newSingleThreadExecutor(r -> new Thread(r, "KementEngine"));
@@ -42,7 +47,9 @@ final class KementEngine implements CommandChannel.Listener, P2PSession.P2PClien
     private volatile P2PSession p2p;
     private volatile boolean previewActive;
     private volatile boolean p2pConnected;
+    private volatile boolean p2pConnectScheduled;
     private volatile long lastPreviewAt;
+    private volatile long lastStreamStartAt;
     private volatile int p2pConnectAttempts;
     private volatile boolean streamStartOk;
     private volatile boolean deviceSeenInState;
@@ -78,6 +85,9 @@ final class KementEngine implements CommandChannel.Listener, P2PSession.P2PClien
                 listener.onLog("P2P: " + p2pConfig.p2p + " | STUN: " + p2pConfig.stun
                         + " | encrypt=" + p2pConfig.encrypted + " | kcp=" + p2pConfig.useKcp);
 
+                EZMediaUtils.ensureLoaded(context);
+                listener.onLog("Decryptor AES oficial carregado.");
+
                 p2p = P2PSession.getInstance(context);
                 p2p.addListener(this);
                 p2p.setEncrypt(p2pConfig.encrypted);
@@ -107,9 +117,10 @@ final class KementEngine implements CommandChannel.Listener, P2PSession.P2PClien
     }
 
     private synchronized void startStatePolling() {
+        if (previewActive) return;
         if (statePollTask != null) statePollTask.cancel(false);
         statePollTask = scheduler.scheduleAtFixedRate(() -> {
-            if (!wanted.get()) return;
+            if (!wanted.get() || previewActive) return;
             CommandChannel c = command;
             if (c != null) c.sendDevicesState();
         }, 1, 1, TimeUnit.SECONDS);
@@ -131,6 +142,7 @@ final class KementEngine implements CommandChannel.Listener, P2PSession.P2PClien
         boolean wasPreview = previewActive;
         previewActive = false;
         p2pConnected = false;
+        p2pConnectScheduled = false;
         stopStatePolling();
         worker.execute(() -> cleanupSession(true, wasPreview));
     }
@@ -142,8 +154,17 @@ final class KementEngine implements CommandChannel.Listener, P2PSession.P2PClien
         try { if (p2p != null) p2p.removeListener(this); } catch (Throwable ignored) {}
         try { if (p2p != null) p2p.logoutP2P(); } catch (Throwable ignored) {}
         try { if (command != null) command.close(); } catch (Throwable ignored) {}
-        command = null; p2p = null; session = null; device = null; sn = null;
-        previewActive = false; p2pConnected = false; streamStartOk = false; p2pConnectAttempts = 0;
+        command = null;
+        p2p = null;
+        session = null;
+        device = null;
+        sn = null;
+        previewActive = false;
+        p2pConnected = false;
+        p2pConnectScheduled = false;
+        streamStartOk = false;
+        p2pConnectAttempts = 0;
+        lastStreamStartAt = 0L;
         deviceSeenInState = false;
         pipeline.reset();
         releaseWakeLock();
@@ -168,7 +189,7 @@ final class KementEngine implements CommandChannel.Listener, P2PSession.P2PClien
                     + " | ip=" + msg.optString("ip", "?")
                     + " | port=" + msg.optInt("port", 0));
             CommandChannel c = command;
-            if (c != null) c.sendDevicesState();
+            if (c != null && !previewActive) c.sendDevicesState();
             return;
         }
 
@@ -185,17 +206,15 @@ final class KementEngine implements CommandChannel.Listener, P2PSession.P2PClien
             listener.onLog("preview-start | wakeup=" + wakeup + " | state=" + msg.optInt("state", -1)
                     + " | mode=" + msg.optInt("mode", -1) + " | pk=" + (pk.isEmpty() ? "vazio" : "AES"));
             listener.onStatus("Campainha acordou. Preparando mídia...");
-            if (command != null) command.sendStreamStart(sn);
+            requestStreamStart("preview-start");
             return;
         }
 
         if ("fast-streaming".equals(cmd) && sn != null && sn.equals(udid)) {
-            if (!previewActive) {
-                activatePreview("fast-streaming sem preview-start");
-                if (command != null) command.sendStreamStart(sn);
-            }
+            if (!previewActive) activatePreview("fast-streaming sem preview-start");
             listener.onLog("fast-streaming: dispositivo pronto para mídia.");
-            scheduleP2PConnect("fast-streaming", 250);
+            requestStreamStart("fast-streaming");
+            scheduleP2PConnect("fast-streaming", 350);
             return;
         }
 
@@ -210,7 +229,7 @@ final class KementEngine implements CommandChannel.Listener, P2PSession.P2PClien
             if (err == 0) {
                 if (!previewActive) activatePreview("stream-start OK");
                 streamStartOk = true;
-                scheduleP2PConnect("stream-start OK", 150);
+                scheduleP2PConnect("stream-start OK", 300);
             }
             return;
         }
@@ -266,42 +285,75 @@ final class KementEngine implements CommandChannel.Listener, P2PSession.P2PClien
         if (seen && !previewActive) {
             activatePreview("devices-state");
             listener.onStatus("Campainha online detectada. Abrindo vídeo...");
-            CommandChannel c = command;
-            if (c != null) c.sendStreamStart(sn);
-            scheduleP2PConnect("devices-state fallback", 600);
+            requestStreamStart("devices-state fallback");
+            scheduleP2PConnect("devices-state fallback", 800);
         }
     }
 
-    private void activatePreview(String source) {
-        previewActive = true;
+    private synchronized void activatePreview(String source) {
         lastPreviewAt = System.currentTimeMillis();
+        if (previewActive) return;
+        previewActive = true;
         streamStartOk = false;
         p2pConnectAttempts = 0;
+        p2pConnectScheduled = false;
+        lastStreamStartAt = 0L;
+        stopStatePolling();
         listener.onLog("Sessão de mídia ativada por " + source + ".");
     }
 
-    private void scheduleP2PConnect(String reason, long delayMs) {
-        if (!wanted.get() || !previewActive) return;
+    private synchronized void requestStreamStart(String reason) {
+        if (!wanted.get() || !previewActive || command == null || sn == null) return;
+        long now = System.currentTimeMillis();
+        if (now - lastStreamStartAt < MIN_STREAM_START_INTERVAL_MS) return;
+        lastStreamStartAt = now;
+        command.sendStreamStart(sn);
+        listener.onLog("stream-start solicitado (" + reason + ").");
+    }
+
+    private synchronized void scheduleP2PConnect(String reason, long delayMs) {
+        if (!wanted.get() || !previewActive || p2pConnected || p2p == null || sn == null) return;
+        if (p2pConnectScheduled || p2pConnectAttempts >= MAX_P2P_ATTEMPTS) return;
+        p2pConnectScheduled = true;
+        scheduleP2PAttempt(reason, Math.max(0, delayMs));
+    }
+
+    private void scheduleP2PAttempt(String reason, long delayMs) {
         scheduler.schedule(() -> {
-            if (!wanted.get() || !previewActive || p2pConnected || p2p == null || sn == null) return;
+            if (!wanted.get() || !previewActive || p2pConnected || p2p == null || sn == null) {
+                p2pConnectScheduled = false;
+                return;
+            }
+
             int attempt = ++p2pConnectAttempts;
             try {
                 int nat = -999;
+                int speed = -999;
                 try { nat = p2p.getNatType(); } catch (Throwable ignored) {}
-                listener.onLog("P2P connect tentativa #" + attempt + " (" + reason + ") | NAT=" + nat);
+                try { speed = p2p.getSpeed(); } catch (Throwable ignored) {}
+                listener.onLog("P2P tentativa #" + attempt + "/" + MAX_P2P_ATTEMPTS
+                        + " (" + reason + ") | NAT=" + nat + " | speed=" + speed);
                 p2p.connectToPeer(sn);
             } catch (Throwable e) {
                 listener.onLog("connectToPeer tentativa #" + attempt + " falhou: " + safeMessage(e));
             }
-            if (attempt < 10) {
-                scheduler.schedule(() -> {
-                    if (!p2pConnected && wanted.get() && previewActive) {
-                        if (command != null) command.sendStreamStart(sn);
-                        scheduleP2PConnect("retry", 0);
-                    }
-                }, 1800, TimeUnit.MILLISECONDS);
+
+            if (!wanted.get() || !previewActive || p2pConnected) {
+                p2pConnectScheduled = false;
+                return;
             }
-        }, Math.max(0, delayMs), TimeUnit.MILLISECONDS);
+
+            if (attempt >= MAX_P2P_ATTEMPTS) {
+                p2pConnectScheduled = false;
+                listener.onStatus("P2P não conectou. Diagnóstico preservado no log.");
+                listener.onLog("P2P esgotou " + MAX_P2P_ATTEMPTS + " tentativas sem callback/dados.");
+                return;
+            }
+
+            requestStreamStart("retry P2P #" + (attempt + 1));
+            long nextDelay = attempt < 3 ? 2500L : 4500L;
+            scheduleP2PAttempt("retry", nextDelay);
+        }, delayMs, TimeUnit.MILLISECONDS);
     }
 
     @Override public void onCommandStatus(String text) { listener.onLog(text); }
@@ -315,7 +367,8 @@ final class KementEngine implements CommandChannel.Listener, P2PSession.P2PClien
                 try {
                     listener.onLog("Reconectando canal de comando...");
                     connectCommandChannel();
-                    startStatePolling();
+                    if (!previewActive) startStatePolling();
+                    else requestStreamStart("reconexão do command");
                 } catch (Throwable e) {
                     listener.onLog("Reconexão falhou: " + safeMessage(e));
                     onCommandDisconnected(e);
@@ -329,22 +382,16 @@ final class KementEngine implements CommandChannel.Listener, P2PSession.P2PClien
         if (sn == null || peer == null) return;
         p2pConnected = connected;
         if (connected) {
+            p2pConnectScheduled = false;
             listener.onStatus("P2P conectado. Recebendo vídeo...");
             listener.onLog("P2P conectado: " + peer);
-            if (command != null) command.sendStreamStart(sn);
+            requestStreamStart("P2P conectado");
         } else {
             listener.onLog("P2P desconectou: " + peer);
             if (wanted.get() && previewActive && System.currentTimeMillis() - lastPreviewAt < 24L * 60 * 60_000L) {
-                scheduler.schedule(() -> {
-                    if (!wanted.get() || p2pConnected || p2p == null || sn == null) return;
-                    try {
-                        listener.onLog("Tentando reconectar P2P...");
-                        if (command != null) command.sendStreamStart(sn);
-                        p2p.connectToPeer(sn);
-                    } catch (Throwable e) {
-                        listener.onLog("Reconexão P2P falhou: " + safeMessage(e));
-                    }
-                }, 2, TimeUnit.SECONDS);
+                p2pConnectScheduled = false;
+                requestStreamStart("callback desconectado");
+                scheduleP2PConnect("callback desconectado", 2000);
             }
         }
     }
@@ -353,6 +400,7 @@ final class KementEngine implements CommandChannel.Listener, P2PSession.P2PClien
         if (!wanted.get() || !previewActive || data == null) return;
         if (!p2pConnected) {
             p2pConnected = true;
+            p2pConnectScheduled = false;
             listener.onLog("CALLBACK de dados P2P antes do connected | peer=" + peer + " | nativeType=" + nativeType);
             listener.onStatus("P2P recebendo dados. Decodificando vídeo...");
         }
@@ -360,10 +408,12 @@ final class KementEngine implements CommandChannel.Listener, P2PSession.P2PClien
     }
 
     @Override public void onPipelineStatus(String text) { listener.onLog(text); }
+
     @Override public void onFirstFrame() {
         listener.onStatus("VÍDEO AO VIVO — sessão mantida ativa");
         listener.onFirstFrame();
     }
+
     @Override public void onPacketStats(long packets, long videoPackets, int lastType) {
         listener.onStats(packets, videoPackets, lastType);
     }
