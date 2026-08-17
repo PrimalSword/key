@@ -1,4 +1,4 @@
-import java.util.Base64
+import java.util.zip.GZIPInputStream
 
 plugins {
     id 'com.android.application'
@@ -32,11 +32,14 @@ android {
     }
 }
 
-def nativeSourceDir = file("$rootDir/native-b64")
+def nativeSourceDir = file("$rootDir/native-gz")
 def nativeOutputDir = file("$projectDir/src/main/jniLibs/arm64-v8a")
 
 tasks.register('restoreNativeLibs') {
-    inputs.files(fileTree(nativeSourceDir) { include '*.b64*' })
+    inputs.files(
+            file("$nativeSourceDir/libVCTP2P.so.gz"),
+            file("$nativeSourceDir/libc++_shared.so.gz")
+    )
     outputs.files(
             file("$nativeOutputDir/libVCTP2P.so"),
             file("$nativeOutputDir/libc++_shared.so")
@@ -44,19 +47,15 @@ tasks.register('restoreNativeLibs') {
 
     doLast {
         nativeOutputDir.mkdirs()
-
-        def restore = { String outputName, String prefix ->
-            StringBuilder encoded = new StringBuilder()
-            def parts = fileTree(nativeSourceDir) { include "${prefix}.*" }.files.sort { a, b -> a.name <=> b.name }
-            if (parts.isEmpty()) throw new GradleException("Native base64 ausente: ${prefix}")
-            parts.each { part ->
-                encoded.append(part.getText('UTF-8').replaceAll('\\s', ''))
+        ['libVCTP2P.so', 'libc++_shared.so'].each { name ->
+            def source = file("$nativeSourceDir/${name}.gz")
+            def target = file("$nativeOutputDir/$name")
+            source.withInputStream { raw ->
+                GZIPInputStream gzip = new GZIPInputStream(raw)
+                target.withOutputStream { out -> gzip.transferTo(out) }
+                gzip.close()
             }
-            file("$nativeOutputDir/$outputName").bytes = Base64.getDecoder().decode(encoded.toString())
         }
-
-        restore('libVCTP2P.so', 'libVCTP2P.so.b64')
-        restore('libc++_shared.so', 'libc++_shared.so.b64')
     }
 }
 
