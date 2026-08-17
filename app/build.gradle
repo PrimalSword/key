@@ -1,4 +1,6 @@
+import java.util.Base64
 import java.util.zip.GZIPInputStream
+import java.io.ByteArrayInputStream
 
 plugins {
     id 'com.android.application'
@@ -32,14 +34,11 @@ android {
     }
 }
 
-def nativeSourceDir = file("$rootDir/native-gz")
+def nativeSourceDir = file("$rootDir/native-gzb64")
 def nativeOutputDir = file("$projectDir/src/main/jniLibs/arm64-v8a")
 
 tasks.register('restoreNativeLibs') {
-    inputs.files(
-            file("$nativeSourceDir/libVCTP2P.so.gz"),
-            file("$nativeSourceDir/libc++_shared.so.gz")
-    )
+    inputs.files(fileTree(nativeSourceDir) { include '*.b64.*' })
     outputs.files(
             file("$nativeOutputDir/libVCTP2P.so"),
             file("$nativeOutputDir/libc++_shared.so")
@@ -47,15 +46,21 @@ tasks.register('restoreNativeLibs') {
 
     doLast {
         nativeOutputDir.mkdirs()
-        ['libVCTP2P.so', 'libc++_shared.so'].each { name ->
-            def source = file("$nativeSourceDir/${name}.gz")
-            def target = file("$nativeOutputDir/$name")
-            source.withInputStream { raw ->
-                GZIPInputStream gzip = new GZIPInputStream(raw)
-                target.withOutputStream { out -> gzip.transferTo(out) }
-                gzip.close()
-            }
+
+        def restore = { String outputName ->
+            String prefix = "${outputName}.gz.b64"
+            def parts = fileTree(nativeSourceDir) { include "${prefix}.*" }.files.sort { a, b -> a.name <=> b.name }
+            if (parts.isEmpty()) throw new GradleException("Native compactado ausente: ${prefix}")
+            StringBuilder encoded = new StringBuilder()
+            parts.each { part -> encoded.append(part.getText('UTF-8').replaceAll('\\s', '')) }
+            byte[] gz = Base64.getDecoder().decode(encoded.toString())
+            GZIPInputStream gzip = new GZIPInputStream(new ByteArrayInputStream(gz))
+            file("$nativeOutputDir/$outputName").withOutputStream { out -> gzip.transferTo(out) }
+            gzip.close()
         }
+
+        restore('libVCTP2P.so')
+        restore('libc++_shared.so')
     }
 }
 
